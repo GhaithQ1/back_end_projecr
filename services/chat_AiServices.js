@@ -11,10 +11,9 @@ const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
 
 
-exports.SindChatAI = asyncHandler(async (req, res, next) => {
+exports.SindChatAI = asyncHandler(async (req, res) => {
   try {
     let { message, threadId } = req.body;
-
 
     let user = await usermodel.findById(req.user._id);
     if (!user) return res.status(404).json({ error: "User not found" });
@@ -27,29 +26,31 @@ exports.SindChatAI = asyncHandler(async (req, res, next) => {
       return res.status(400).json({ error: "Message content is required" });
     }
 
+    const allowedExtensions = ['.pdf', '.txt', '.docx', '.csv', '.jpeg', '.jpg', '.png'];
     const fileIds = [];
-    const allowedExtensions = ['.pdf', '.txt', '.docx', '.csv','.jpeg','.jpg','.png']; // الامتدادات المدعومة
 
+    // Handle file uploads if any
     if (req.files && req.files.length > 0) {
       for (const file of req.files) {
         const ext = path.extname(file.originalname).toLowerCase();
 
         if (!allowedExtensions.includes(ext)) {
-          fs.unlinkSync(file.path); // نحذف الملف غير المدعوم
+          fs.unlinkSync(file.path);
           return res.status(400).json({ error: `Unsupported file type: ${ext}` });
         }
 
         const uploadRes = await openai.files.create({
           file: fs.createReadStream(file.path),
           purpose: "assistants",
-          name: file.originalname, // نحدد اسم الملف عند الرفع
+          name: file.originalname,
         });
 
         fileIds.push(uploadRes.id);
-        fs.unlinkSync(file.path); // حذف الملف بعد الرفع
+        fs.unlinkSync(file.path);
       }
     }
 
+    // Prepare message data
     const messageData = {
       role: "user",
       content: message,
@@ -59,22 +60,48 @@ exports.SindChatAI = asyncHandler(async (req, res, next) => {
       messageData.file_ids = fileIds;
     }
 
+    // Save user message to OpenAI thread
     await openai.beta.threads.messages.create(threadId, messageData);
 
-    const run = await openai.beta.threads.runs.create(threadId, {
-      assistant_id: process.env.ASSISTANT_ID,
+    // Initialize the streaming response
+    res.setHeader("Content-Type", "text/event-stream");
+    res.setHeader("Cache-Control", "no-cache");
+    res.setHeader("Connection", "keep-alive");
+
+    // Send the message to OpenAI API and stream the response
+    const completion = await openai.chat.completions.create({
+      model: "gpt-4",
+      messages: [
+        { role: "user", content: message }
+      ],
+      stream: true,
     });
 
-    let runStatus;
-    do {
-      await new Promise(resolve => setTimeout(resolve, 1000));
-      runStatus = await openai.beta.threads.runs.retrieve(threadId, run.id);
-    } while (runStatus.status !== "completed");
+    let assistantReply = '';
 
-    const messages = await openai.beta.threads.messages.list(threadId);
-    const assistantMessage = messages.data.find(m => m.role === 'assistant')?.content[0]?.text?.value;
+    // Write each chunk of the assistant's response and save it in OpenAI thread
+    for await (const chunk of completion) {
+      const content = chunk.choices?.[0]?.delta?.content;
+      if (content) {
+        assistantReply += content;  // تجمع كل الأجزاء معاً
 
-    res.json({ reply: assistantMessage });
+        // إرسال البيانات بشكل مباشر
+        res.write(`data: ${content}\n\n`);
+      }
+    }
+
+    // بعد اكتمال الستريم، حفظ رسالة البوت بالكامل
+    if (assistantReply) {
+      const assistantMessageData = {
+        role: "assistant",
+        content: assistantReply, // ارسال الرد الكامل للبوت
+      };
+      await openai.beta.threads.messages.create(threadId, assistantMessageData);
+    }
+
+    // Send the completion signal and end the stream
+    res.write("data: [DONE]\n\n");
+    res.end();
 
   } catch (err) {
     console.error("Chat AI error:", err);
