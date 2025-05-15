@@ -11,7 +11,6 @@ dotenv.config({ path: "config.env" });
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
 
-
 const MAX_MESSAGES = 30;
 const MESSAGE_EXPIRATION_MS = 48 * 60 * 60 * 1000; // 48 ساعة بالميلي ثانية
 
@@ -108,6 +107,7 @@ exports.SindChatAI = asyncHandler(async (req, res) => {
 
 
 
+
 exports.GetChatAI = asyncHandler(async (req, res, next) => {
   try {
     // جلب المستخدم بناءً على الـ userId
@@ -119,37 +119,36 @@ exports.GetChatAI = asyncHandler(async (req, res, next) => {
     }
 
     // الحصول على الـ thread_id المحدد من الطلب
-const threadId = req.params.id;// فرضًا يتم إرسال الـ thread_id في الـ URL
+    const threadId = req.params.id;// فرضًا يتم إرسال الـ thread_id في الـ URL
+
+    // تحقق من وجود threadId
+    if (!threadId) {
+      return res.json({ messages: [] });
+    }
 
     // تحقق من أن الـ thread_id موجود في الـ user.thread_id
-
     const selectedThread = user.thread_id.find(thread => thread.id_thread === threadId);
-    
-    // إذا لم يكن هناك thread_id مطابق، ارجع برسالة فارغة
-if (!selectedThread) {
-  console.log("⚠️ No matching thread found for threadId:", threadId);
-  return res.json({ messages: [] });
-}
-    // استدعاء الرسائل الخاصة بالمحادثة عبر OpenAI API
-    const messages = await openai.beta.threads.messages.list(selectedThread.id_thread);
+    if (!selectedThread) {
+      console.log("⚠️ No matching thread found for threadId:", threadId);
+      return res.json({ messages: [] });
+    }
 
-
-
-    // تنسيق الرسائل لتتوافق مع الهيكل المطلوب
-    const formatted = messages.data.map(m => ({
-      role: m.role,
-      content: m.content[0]?.text?.value || "", // التأكد من وجود النص
-    })).reverse(); // من الأقدم للأحدث
-    
-    // إرسال الرسائل بعد تنسيقها
-    res.json({ messages: formatted });
-
+    // جلب الرسائل من Redis باستخدام userId و threadId
+    let chatHistory = [];
+    try {
+      const redisData = await redisClient.get(`chat_history:${req.user._id}:${threadId}`);
+      if (redisData) {
+        chatHistory = JSON.parse(redisData);
+      }
+    } catch (err) {
+      console.error('Error reading chat history from Redis:', err);
+    }
+    res.json({ messages: chatHistory });
   } catch (err) {
     console.log(err);
     res.status(500).json({ error: "فشل في استرجاع المحادثة." });
   }
 });
-
 
 exports.CreateNewThread = asyncHandler(async (req, res, next) => {
   try {
@@ -167,6 +166,13 @@ exports.CreateNewThread = asyncHandler(async (req, res, next) => {
     // حفظ thread الجديد
     user.thread_id.push({ id_thread: thread.id });
     await user.save();
+
+    // إنشاء سجل رسائل جديد وفارغ في Redis لهذا الـ threadId
+    try {
+      await redisClient.set(`chat_history:${req.user._id}:${thread.id}`, JSON.stringify([]));
+    } catch (err) {
+      console.error('Error initializing chat history for new thread in Redis:', err);
+    }
 
     // إرسال الاستجابة مع thread_id الجديد
     res.status(201).json({
@@ -195,12 +201,19 @@ exports.DeleteThread = asyncHandler(async (req, res, next) => {
     // التحقق من وجود المحادثة في قائمة محادثات المستخدم
     const threadIndex = user.thread_id.findIndex(thread => thread.id_thread === threadId);
     if (threadIndex === -1) {
-      return res.status(404).json({ error: "Thread not found for this user" });
+      return res.status(404).json({ error: "Thread not found" });
     }
 
-    // حذف المحادثة من قائمة محادثات المستخدم
+    // حذف المحادثة من قائمة المستخدم
     user.thread_id.splice(threadIndex, 1);
     await user.save();
+
+    // حذف سجل الرسائل من Redis لهذا الـ threadId
+    try {
+      await redisClient.del(`chat_history:${req.user._id}:${threadId}`);
+    } catch (err) {
+      console.error('Error deleting chat history from Redis:', err);
+    }
 
     // محاولة حذف المحادثة من OpenAI
     try {
