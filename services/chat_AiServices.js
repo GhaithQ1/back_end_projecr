@@ -1,6 +1,7 @@
 const asyncHandler = require("express-async-handler");
 const usermodel = require("../models/userModels");
 const { OpenAI } = require('openai');
+const redisClient = require('./redisClient');
 const multer = require("multer");
 const fs = require("fs");
 const path = require("path");
@@ -50,6 +51,24 @@ exports.SindChatAI = asyncHandler(async (req, res) => {
       }
     }
 
+
+    // 1. جلب الرسائل السابقة من Redis
+    let chatHistory = [];
+    try {
+      const redisData = await redisClient.get(`chat_history:${userId}:${threadId}`);
+      if (redisData) {
+        chatHistory = JSON.parse(redisData);
+      }
+    } catch (err) {
+      console.error('Error reading chat history from Redis:', err);
+    }
+
+    // 2. أضف رسالة المستخدم الجديدة
+    chatHistory.push({ role: 'user', content: message });
+
+    
+    const messagesToSend = chatHistory.map(msg => ({ role: msg.role, content: msg.content }));
+
     // Prepare message data
     const messageData = {
       role: "user",
@@ -71,9 +90,7 @@ exports.SindChatAI = asyncHandler(async (req, res) => {
     // Send the message to OpenAI API and stream the response
     const completion = await openai.chat.completions.create({
       model: "gpt-4",
-      messages: [
-        { role: "user", content: message }
-      ],
+      messages: messagesToSend,
       stream: true,
     });
 
@@ -98,6 +115,14 @@ exports.SindChatAI = asyncHandler(async (req, res) => {
       };
       await openai.beta.threads.messages.create(threadId, assistantMessageData);
     }
+  // 3. أضف رد البوت إلى المحادثة واحفظها في Redis
+    chatHistory.push({ role: 'assistant', content: botResponse });
+    try {
+      await redisClient.set(`chat_history:${userId}:${threadId}`, JSON.stringify(chatHistory));
+    } catch (err) {
+      console.error('Error saving chat history to Redis:', err);
+    }
+
 
     // Send the completion signal and end the stream
     res.write("data: [DONE]\n\n");
