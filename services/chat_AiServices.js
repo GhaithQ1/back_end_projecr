@@ -12,6 +12,9 @@ const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
 
 
+const MAX_MESSAGES = 30;
+const MESSAGE_EXPIRATION_MS = 48 * 60 * 60 * 1000; // 48 ساعة بالميلي ثانية
+
 exports.SindChatAI = asyncHandler(async (req, res) => {
   try {
     let { message, threadId } = req.body;
@@ -28,53 +31,37 @@ exports.SindChatAI = asyncHandler(async (req, res) => {
       return res.status(400).json({ error: "Message content is required" });
     }
 
-    const allowedExtensions = ['.pdf', '.txt', '.docx', '.csv', '.jpeg', '.jpg', '.png'];
-    const fileIds = [];
-
-    // Handle file uploads if any
-    if (req.files && req.files.length > 0) {
-      for (const file of req.files) {
-        const ext = path.extname(file.originalname).toLowerCase();
-
-        if (!allowedExtensions.includes(ext)) {
-          fs.unlinkSync(file.path);
-          return res.status(400).json({ error: `Unsupported file type: ${ext}` });
-        }
-
-        const uploadRes = await openai.files.create({
-          file: fs.createReadStream(file.path),
-          purpose: "assistants",
-          name: file.originalname,
-        });
-
-        fileIds.push(uploadRes.id);
-        fs.unlinkSync(file.path);
-      }
-    }
-
-    // 1. جلب الرسائل السابقة من Redis
+    // --- جلب الرسائل السابقة من Redis ---
     let chatHistory = [];
     try {
       const redisData = await redisClient.get(`chat_history:${userId}:${threadId}`);
       if (redisData) {
         chatHistory = JSON.parse(redisData);
+
+        // فلترة الرسائل القديمة (أكثر من 48 ساعة) والتخلص منها
+        const now = Date.now();
+        chatHistory = chatHistory.filter(msg => (now - msg.timestamp) <= MESSAGE_EXPIRATION_MS);
+
+        // الاحتفاظ بآخر 30 رسالة فقط
+        if (chatHistory.length > MAX_MESSAGES) {
+          chatHistory = chatHistory.slice(chatHistory.length - MAX_MESSAGES);
+        }
       }
     } catch (err) {
       console.error('Error reading chat history from Redis:', err);
     }
 
-    // 2. أضف رسالة المستخدم الجديدة
-    chatHistory.push({ role: 'user', content: message });
+    // --- أضف رسالة المستخدم الجديدة مع الطابع الزمني ---
+    chatHistory.push({ role: 'user', content: message, timestamp: Date.now() });
 
-    // Prepare message data for OpenAI
+    // تحضير الرسائل للإرسال إلى OpenAI بدون الطابع الزمني
     const messagesToSend = chatHistory.map(msg => ({ role: msg.role, content: msg.content }));
 
-    // Initialize the streaming response
+    // إعداد الاستجابة للـ stream
     res.setHeader("Content-Type", "text/event-stream");
     res.setHeader("Cache-Control", "no-cache");
     res.setHeader("Connection", "keep-alive");
 
-    // Send the message to the OpenAI API and stream the response
     let botResponse = '';
     const completion = await openai.chat.completions.create({
       model: "gpt-4",
@@ -82,7 +69,6 @@ exports.SindChatAI = asyncHandler(async (req, res) => {
       stream: true,
     });
 
-    // Write each chunk of the assistant's response
     for await (const chunk of completion) {
       const content = chunk.choices?.[0]?.delta?.content;
       if (content) {
@@ -91,15 +77,24 @@ exports.SindChatAI = asyncHandler(async (req, res) => {
       }
     }
 
-    // 3. أضف رد البوت إلى المحادثة واحفظها في Redis
-    chatHistory.push({ role: 'assistant', content: botResponse });
+    // أضف رد البوت مع الطابع الزمني
+    chatHistory.push({ role: 'assistant', content: botResponse, timestamp: Date.now() });
+
+    // إحفظ المحادثة بعد فلترة وتنظيف الرسائل القديمة + بحدود آخر 30 رسالة
     try {
+      // فلترة بعد إضافة رد البوت، لأن الوقت مضى
+      const now = Date.now();
+      chatHistory = chatHistory.filter(msg => (now - msg.timestamp) <= MESSAGE_EXPIRATION_MS);
+
+      if (chatHistory.length > MAX_MESSAGES) {
+        chatHistory = chatHistory.slice(chatHistory.length - MAX_MESSAGES);
+      }
+
       await redisClient.set(`chat_history:${userId}:${threadId}`, JSON.stringify(chatHistory));
     } catch (err) {
       console.error('Error saving chat history to Redis:', err);
     }
 
-    // Send the completion signal and end the stream
     res.write("data: [DONE]\n\n");
     res.end();
 
