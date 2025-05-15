@@ -45,6 +45,7 @@ const app = express();
 const allowedOrigins = [
   'http://localhost:3000',
   'https://ss-rr-gg-main-ai.vercel.app'
+
 ];
 
 app.use(cors({
