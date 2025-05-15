@@ -1,8 +1,6 @@
 const asyncHandler = require("express-async-handler");
 const usermodel = require("../models/userModels");
 const { OpenAI } = require('openai');
-const redisClient = require('./redisClient');
-
 const multer = require("multer");
 const fs = require("fs");
 const path = require("path");
@@ -12,15 +10,12 @@ dotenv.config({ path: "config.env" });
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
 
-const { Readable } = require('stream');
-
 
 exports.SindChatAI = asyncHandler(async (req, res) => {
   try {
     let { message, threadId } = req.body;
-    const userId = req.user._id.toString();
 
-    let user = await usermodel.findById(userId);
+    let user = await usermodel.findById(req.user._id);
     if (!user) return res.status(404).json({ error: "User not found" });
 
     if (!threadId && user.thread_id.length > 0) {
@@ -55,51 +50,53 @@ exports.SindChatAI = asyncHandler(async (req, res) => {
       }
     }
 
-    // 1. جلب الرسائل السابقة من Redis
-    let chatHistory = [];
-    try {
-      const redisData = await redisClient.get(`chat_history:${userId}:${threadId}`);
-      if (redisData) {
-        chatHistory = JSON.parse(redisData);
-      }
-    } catch (err) {
-      console.error('Error reading chat history from Redis:', err);
+    // Prepare message data
+    const messageData = {
+      role: "user",
+      content: message,
+    };
+
+    if (fileIds.length > 0) {
+      messageData.file_ids = fileIds;
     }
 
-    // 2. أضف رسالة المستخدم الجديدة
-    chatHistory.push({ role: 'user', content: message });
-
-    // Prepare message data for OpenAI
-    const messagesToSend = chatHistory.map(msg => ({ role: msg.role, content: msg.content }));
+    // Save user message to OpenAI thread
+    await openai.beta.threads.messages.create(threadId, messageData);
 
     // Initialize the streaming response
     res.setHeader("Content-Type", "text/event-stream");
     res.setHeader("Cache-Control", "no-cache");
     res.setHeader("Connection", "keep-alive");
 
-    // Send the message to the OpenAI API and stream the response
-    let botResponse = '';
+    // Send the message to OpenAI API and stream the response
     const completion = await openai.chat.completions.create({
       model: "gpt-4",
-      messages: messagesToSend,
+      messages: [
+        { role: "user", content: message }
+      ],
       stream: true,
     });
 
-    // Write each chunk of the assistant's response
+    let assistantReply = '';
+
+    // Write each chunk of the assistant's response and save it in OpenAI thread
     for await (const chunk of completion) {
       const content = chunk.choices?.[0]?.delta?.content;
       if (content) {
-        botResponse += content;
+        assistantReply += content;  // تجمع كل الأجزاء معاً
+
+        // إرسال البيانات بشكل مباشر
         res.write(`data: ${content}\n\n`);
       }
     }
 
-    // 3. أضف رد البوت إلى المحادثة واحفظها في Redis
-    chatHistory.push({ role: 'assistant', content: botResponse });
-    try {
-      await redisClient.set(`chat_history:${userId}:${threadId}`, JSON.stringify(chatHistory));
-    } catch (err) {
-      console.error('Error saving chat history to Redis:', err);
+    // بعد اكتمال الستريم، حفظ رسالة البوت بالكامل
+    if (assistantReply) {
+      const assistantMessageData = {
+        role: "assistant",
+        content: assistantReply, // ارسال الرد الكامل للبوت
+      };
+      await openai.beta.threads.messages.create(threadId, assistantMessageData);
     }
 
     // Send the completion signal and end the stream
@@ -116,13 +113,6 @@ exports.SindChatAI = asyncHandler(async (req, res) => {
 
 
 
-
-
-
-
-
-
-
 exports.GetChatAI = asyncHandler(async (req, res, next) => {
   try {
     // جلب المستخدم بناءً على الـ userId
@@ -134,36 +124,37 @@ exports.GetChatAI = asyncHandler(async (req, res, next) => {
     }
 
     // الحصول على الـ thread_id المحدد من الطلب
-    const threadId = req.params.id;// فرضًا يتم إرسال الـ thread_id في الـ URL
-
-    // تحقق من وجود threadId
-    if (!threadId) {
-      return res.json({ messages: [] });
-    }
+const threadId = req.params.id;// فرضًا يتم إرسال الـ thread_id في الـ URL
 
     // تحقق من أن الـ thread_id موجود في الـ user.thread_id
-    const selectedThread = user.thread_id.find(thread => thread.id_thread === threadId);
-    if (!selectedThread) {
-      console.log("⚠️ No matching thread found for threadId:", threadId);
-      return res.json({ messages: [] });
-    }
 
-    // جلب الرسائل من Redis باستخدام userId و threadId
-    let chatHistory = [];
-    try {
-      const redisData = await redisClient.get(`chat_history:${req.user._id}:${threadId}`);
-      if (redisData) {
-        chatHistory = JSON.parse(redisData);
-      }
-    } catch (err) {
-      console.error('Error reading chat history from Redis:', err);
-    }
-    res.json({ messages: chatHistory });
+    const selectedThread = user.thread_id.find(thread => thread.id_thread === threadId);
+    
+    // إذا لم يكن هناك thread_id مطابق، ارجع برسالة فارغة
+if (!selectedThread) {
+  console.log("⚠️ No matching thread found for threadId:", threadId);
+  return res.json({ messages: [] });
+}
+    // استدعاء الرسائل الخاصة بالمحادثة عبر OpenAI API
+    const messages = await openai.beta.threads.messages.list(selectedThread.id_thread);
+
+
+
+    // تنسيق الرسائل لتتوافق مع الهيكل المطلوب
+    const formatted = messages.data.map(m => ({
+      role: m.role,
+      content: m.content[0]?.text?.value || "", // التأكد من وجود النص
+    })).reverse(); // من الأقدم للأحدث
+    
+    // إرسال الرسائل بعد تنسيقها
+    res.json({ messages: formatted });
+
   } catch (err) {
     console.log(err);
     res.status(500).json({ error: "فشل في استرجاع المحادثة." });
   }
 });
+
 
 exports.CreateNewThread = asyncHandler(async (req, res, next) => {
   try {
@@ -181,13 +172,6 @@ exports.CreateNewThread = asyncHandler(async (req, res, next) => {
     // حفظ thread الجديد
     user.thread_id.push({ id_thread: thread.id });
     await user.save();
-
-    // إنشاء سجل رسائل جديد وفارغ في Redis لهذا الـ threadId
-    try {
-      await redisClient.set(`chat_history:${req.user._id}:${thread.id}`, JSON.stringify([]));
-    } catch (err) {
-      console.error('Error initializing chat history for new thread in Redis:', err);
-    }
 
     // إرسال الاستجابة مع thread_id الجديد
     res.status(201).json({
@@ -216,19 +200,12 @@ exports.DeleteThread = asyncHandler(async (req, res, next) => {
     // التحقق من وجود المحادثة في قائمة محادثات المستخدم
     const threadIndex = user.thread_id.findIndex(thread => thread.id_thread === threadId);
     if (threadIndex === -1) {
-      return res.status(404).json({ error: "Thread not found" });
+      return res.status(404).json({ error: "Thread not found for this user" });
     }
 
-    // حذف المحادثة من قائمة المستخدم
+    // حذف المحادثة من قائمة محادثات المستخدم
     user.thread_id.splice(threadIndex, 1);
     await user.save();
-
-    // حذف سجل الرسائل من Redis لهذا الـ threadId
-    try {
-      await redisClient.del(`chat_history:${req.user._id}:${threadId}`);
-    } catch (err) {
-      console.error('Error deleting chat history from Redis:', err);
-    }
 
     // محاولة حذف المحادثة من OpenAI
     try {
@@ -248,11 +225,6 @@ exports.DeleteThread = asyncHandler(async (req, res, next) => {
     res.status(500).json({ error: "Internal Server Error" });
   }
 });
-
-
-
-
-
 
 
 
